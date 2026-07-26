@@ -55,6 +55,7 @@ class Settings(BaseSettings):
     lemonsqueezy_test_mode: str = "true"
 
     anthropic_api_key: str = ""
+    glm_api_key: str = ""
     sentry_dsn_backend: str = ""
     agent_trigger_key: str = ""
 

@@ -1,5 +1,59 @@
 # ContractForge — Build State
 
+## [2026-07-26T00:00:00Z] Session — GLM-5.2 fallback + live QA root cause
+
+**Status:** COMPLETE — GLM-5.2 primary model shipped with Claude Sonnet automatic fallback
+
+### Root cause of tonight's "generation broken" report
+
+`POST /contracts/generate` was failing with "Your credit balance is too low to access the
+Anthropic API" — **an Anthropic billing/credit exhaustion issue, not a code bug.** Credits
+need topping up in the Anthropic console (separate, time-critical action — not part of this
+change).
+
+### Fix shipped: GLM-5.2 as primary, Claude Sonnet as automatic fallback
+
+To prevent a single provider running dry from blocking generation again (and because GLM-5.2
+is meaningfully cheaper per contract long-term), `/contracts/generate` now tries GLM-5.2
+(via OpenRouter, model `z-ai/glm-5.2`) first; on any auth/rate-limit/network/malformed-response
+failure it falls back to the existing Claude Sonnet 4.6 path unchanged. Mirrors the resilience
+pattern already proven in ForgeOS's `llm/router.py`.
+
+| File | Change |
+|---|---|
+| `backend/app/config.py` | Added `glm_api_key` setting (`GLM_API_KEY` from Doppler `contractforge/prd`) |
+| `backend/app/routers/contracts.py` | Added `_call_glm()` (raw httpx call to OpenRouter); `generate_contract()` tries GLM first, falls back to Claude on failure |
+| `backend/tests/test_glm_fallback.py` | 4 new tests (TDD): GLM success, GLM auth failure → fallback, GLM malformed response → fallback, GLM not configured → Claude-only |
+
+### Live QA before shipping
+
+Per the shipping gate, generated 3 real contracts through GLM-5.2 against production
+(`doppler run --config prd`) before deploying: web dev (₹120k), graphic design (₹45k),
+content writing (₹36k). All verified: exact 8-section structure, correct GST math, Indian
+Contract Act 1872 §73-74 + Arbitration Act 1996 clauses present, no placeholder brackets,
+never self-identifies as Claude/Anthropic.
+
+**Caveat found (pre-existing, not a regression):** none of the 3 contracts include a DPDP
+Act clause — the shared system prompt (unchanged, used by both GLM and Claude) never
+requests one. Claude-only generation has the same gap today. Not fixed in this session;
+flag as a separate scope item if DPDP coverage is wanted.
+
+### Separate bug identified (still open, not fixed here)
+
+Frontend signup still shows a "check your email to confirm" message, but **Confirm Email is
+disabled project-wide** in Supabase — so the message is misleading (no confirmation email
+is actually required or sent). This was previously tracked as S9-5 ("low priority, user
+manages manually") but is now understood to be this specific mismatch, not just a UX nice-to-have.
+Needs its own fix in a future session (either re-enable Confirm Email, or remove the
+misleading copy from the signup flow).
+
+### Test counts
+
+26/26 backend tests green (`python3 -m pytest backend/tests/`). Frontend `tsc --noEmit`
+clean (untouched by this change).
+
+---
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 DAY 159 — Greek aesthetic overhaul complete.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

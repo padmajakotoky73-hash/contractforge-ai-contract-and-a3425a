@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import io
+import logging
 import os
 import urllib.request
 from datetime import datetime
 from typing import Optional
 
+import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
@@ -31,8 +33,12 @@ from ..config import settings
 from ..services.entitlement import check_entitlement
 
 router = APIRouter(prefix="/contracts", tags=["contracts"])
+logger = logging.getLogger(__name__)
 
 _INR = "₹"  # ₹
+
+_GLM_MODEL = "z-ai/glm-5.2"
+_GLM_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 
 # ── Font ──────────────────────────────────────────────────────────────────────
 
@@ -356,6 +362,31 @@ def _paywall_detail(reason: str) -> dict:
     }
 
 
+def _call_glm(system_prompt: str, user_prompt: str) -> str:
+    """Call GLM-5.2 via OpenRouter. Raises on auth/rate-limit/network/malformed-response
+    failures so the caller can fall back to Claude."""
+    resp = httpx.post(
+        _GLM_ENDPOINT,
+        headers={
+            "Authorization": f"Bearer {settings.glm_api_key}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": _GLM_MODEL,
+            "max_tokens": 4096,
+            "temperature": 0.3,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        },
+        timeout=30.0,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 
@@ -393,11 +424,6 @@ async def generate_contract(
     allowed, reason = await check_entitlement(payload.user_email, supabase, consume=True)
     if not allowed:
         raise HTTPException(status_code=402, detail=_paywall_detail(reason))
-
-    if not settings.anthropic_api_key:
-        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured on server")
-
-    client = _anthropic.Anthropic(api_key=settings.anthropic_api_key)
 
     jurisdiction_clause = _JURISDICTION_CLAUSES.get(
         payload.jurisdiction, _JURISDICTION_CLAUSES["India"]
@@ -442,20 +468,37 @@ async def generate_contract(
         f"'Service Provider' for freelancer. No brackets, no placeholders."
     )
 
-    try:
-        message = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=4096,
-            temperature=0.3,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}],
-        )
-    except _anthropic.AuthenticationError as e:
-        raise HTTPException(status_code=401, detail=f"Anthropic auth failed: {e}")
-    except _anthropic.APIError as e:
-        raise HTTPException(status_code=502, detail=f"Anthropic API error: {e}")
+    content: Optional[str] = None
 
-    content = message.content[0].text
+    if settings.glm_api_key:
+        try:
+            content = _call_glm(system_prompt, user_prompt)
+        except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as e:
+            logger.warning("GLM-5.2 generation failed, falling back to Claude: %s", e)
+
+    if content is None:
+        if not settings.anthropic_api_key:
+            raise HTTPException(
+                status_code=503, detail="ANTHROPIC_API_KEY not configured on server"
+            )
+
+        client = _anthropic.Anthropic(api_key=settings.anthropic_api_key)
+
+        try:
+            message = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=4096,
+                temperature=0.3,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+        except _anthropic.AuthenticationError as e:
+            raise HTTPException(status_code=401, detail=f"Anthropic auth failed: {e}")
+        except _anthropic.APIError as e:
+            raise HTTPException(status_code=502, detail=f"Anthropic API error: {e}")
+
+        content = message.content[0].text
+
     contract_id = f"cf-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
 
     return ContractGenerateResponse(
